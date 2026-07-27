@@ -20,7 +20,7 @@ pipeline {
 
     environment {
         // GitHub configuration
-        GIT_REPOSITORY = 'https://github.com/MaximusAP/MaximusLabOG.git'
+        GIT_REPOSITORY = 'https://github.com/MaximusAP/MaximusLabOG-3.git'
         GIT_BRANCH     = 'master'
 
         // Nexus Docker registry
