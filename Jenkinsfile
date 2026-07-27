@@ -41,6 +41,7 @@ pipeline {
         RENDERED_MANIFEST = 'rendered-k8s.yaml'
 
         FULL_IMAGE = "${REGISTRY}/${IMAGE_NAME}:${BUILD_NUMBER}"
+        LATEST_IMAGE = "${REGISTRY}/${IMAGE_NAME}:latest"
     }
 
     stages {
@@ -63,19 +64,19 @@ pipeline {
                     echo "===== Workspace files ====="
                     find . -maxdepth 3 -type f | sort
 
-                    echo "===== Validate application files ====="
+                    echo "===== Validate required files ====="
 
                     test -f Dockerfile
                     test -f nginx.conf
                     test -f index.html
                     test -f "$KUBERNETES_MANIFEST"
 
-                    echo "===== Validate image placeholder ====="
+                    echo "===== Validate Kubernetes image placeholder ====="
 
                     grep -q 'IMAGE_PLACEHOLDER' "$KUBERNETES_MANIFEST"
                     grep -n 'IMAGE_PLACEHOLDER' "$KUBERNETES_MANIFEST"
 
-                    echo "GitHub checkout validation completed."
+                    echo "Checkout validation completed."
                 '''
             }
         }
@@ -86,20 +87,17 @@ pipeline {
                     set -eux
 
                     echo "===== Jenkins agent information ====="
-
                     whoami
                     hostname
                     pwd
 
                     echo "===== Installed tools ====="
-
                     git --version
                     docker --version
                     kubectl version --client
                     curl --version | head -1
 
                     echo "===== Docker daemon connectivity ====="
-
                     docker ps
 
                     echo "Tool validation completed."
@@ -113,7 +111,7 @@ pipeline {
                     set -eux
 
                     echo "===== Build Docker image ====="
-                    echo "$FULL_IMAGE"
+                    echo "Image: $FULL_IMAGE"
 
                     docker build \
                         --pull \
@@ -135,21 +133,6 @@ pipeline {
                     CONTAINER_NAME="maximuslabog-smoke-${BUILD_NUMBER}"
                     SMOKE_BASE_URL="http://${DOCKER_HOST_IP}:${SMOKE_TEST_PORT}"
 
-                    echo "===== Remove an existing smoke-test container ====="
-
-                    docker rm \
-                        --force \
-                        "$CONTAINER_NAME" \
-                        >/dev/null 2>&1 || true
-
-                    echo "===== Start smoke-test container ====="
-
-                    docker run \
-                        --detach \
-                        --name "$CONTAINER_NAME" \
-                        --publish "${SMOKE_TEST_PORT}:80" \
-                        "$FULL_IMAGE"
-
                     cleanup_smoke_test() {
                         echo "===== Smoke-test container logs ====="
 
@@ -163,12 +146,48 @@ pipeline {
                             >/dev/null 2>&1 || true
                     }
 
+                    echo "===== Remove an existing named container ====="
+
+                    docker rm \
+                        --force \
+                        "$CONTAINER_NAME" \
+                        >/dev/null 2>&1 || true
+
+                    echo "===== Check whether port is already allocated ====="
+
+                    EXISTING_CONTAINER=$(
+                        docker ps \
+                            --filter "publish=${SMOKE_TEST_PORT}" \
+                            --format '{{.ID}}' |
+                        head -1
+                    )
+
+                    if [ -n "$EXISTING_CONTAINER" ]
+                    then
+                        echo "Port ${SMOKE_TEST_PORT} is being used by:"
+                        docker ps --filter "id=$EXISTING_CONTAINER"
+
+                        echo "Removing the container using the smoke-test port."
+
+                        docker rm \
+                            --force \
+                            "$EXISTING_CONTAINER"
+                    fi
+
+                    echo "===== Start smoke-test container ====="
+
+                    docker run \
+                        --detach \
+                        --name "$CONTAINER_NAME" \
+                        --publish "${SMOKE_TEST_PORT}:80" \
+                        "$FULL_IMAGE"
+
                     trap cleanup_smoke_test EXIT
 
-                    HEALTHY=false
+                    echo "Waiting for:"
+                    echo "${SMOKE_BASE_URL}/healthz"
 
-                    echo "Waiting for application:"
-                    echo "$SMOKE_BASE_URL/healthz"
+                    HEALTHY=false
 
                     for attempt in $(seq 1 20)
                     do
@@ -178,7 +197,7 @@ pipeline {
                             --fail \
                             --silent \
                             --show-error \
-                            "$SMOKE_BASE_URL/healthz"
+                            "${SMOKE_BASE_URL}/healthz"
                         then
                             echo
                             HEALTHY=true
@@ -190,31 +209,67 @@ pipeline {
 
                     if [ "$HEALTHY" != "true" ]
                     then
-                        echo "ERROR: Local container health check failed."
+                        echo "ERROR: Local health check failed."
                         exit 1
                     fi
 
                     echo
-                    echo "===== Test health endpoint ====="
+                    echo "===== Validate health endpoint ====="
 
-                    curl \
-                        --fail \
-                        --silent \
-                        --show-error \
-                        "$SMOKE_BASE_URL/healthz"
+                    HEALTH_HTTP_CODE=$(
+                        curl \
+                            --silent \
+                            --output /dev/null \
+                            --write-out '%{http_code}' \
+                            "${SMOKE_BASE_URL}/healthz"
+                    )
 
-                    echo
-                    echo "===== Test website endpoint ====="
+                    echo "Health endpoint HTTP status: $HEALTH_HTTP_CODE"
 
-                    curl \
-                        --fail \
-                        --silent \
-                        --show-error \
-                        "$SMOKE_BASE_URL/" |
-                        grep -qi 'Maximus'
+                    if [ "$HEALTH_HTTP_CODE" != "200" ]
+                    then
+                        echo "ERROR: Health endpoint did not return HTTP 200."
+                        exit 1
+                    fi
 
-                    echo "Website content validation passed."
-                    echo "Local container smoke test completed."
+                    echo "===== Validate website endpoint ====="
+
+                    WEBSITE_HTTP_CODE=$(
+                        curl \
+                            --silent \
+                            --output /dev/null \
+                            --write-out '%{http_code}' \
+                            "${SMOKE_BASE_URL}/"
+                    )
+
+                    echo "Website HTTP status: $WEBSITE_HTTP_CODE"
+
+                    if [ "$WEBSITE_HTTP_CODE" != "200" ]
+                    then
+                        echo "ERROR: Website did not return HTTP 200."
+                        exit 1
+                    fi
+
+                    echo "===== Validate downloaded website size ====="
+
+                    WEBSITE_SIZE=$(
+                        curl \
+                            --fail \
+                            --silent \
+                            --show-error \
+                            "${SMOKE_BASE_URL}/" |
+                        wc -c
+                    )
+
+                    echo "Website response size: $WEBSITE_SIZE bytes"
+
+                    if [ "$WEBSITE_SIZE" -lt 1000 ]
+                    then
+                        echo "ERROR: Website response appears unexpectedly small."
+                        exit 1
+                    fi
+
+                    echo "Local container smoke test completed successfully."
                 '''
             }
         }
@@ -243,19 +298,13 @@ pipeline {
 
                         docker push "$FULL_IMAGE"
 
-                        echo "===== Push latest image ====="
+                        echo "===== Tag and push latest image ====="
 
                         docker tag \
                             "$FULL_IMAGE" \
-                            "${REGISTRY}/${IMAGE_NAME}:latest"
+                            "$LATEST_IMAGE"
 
-                        docker push \
-                            "${REGISTRY}/${IMAGE_NAME}:latest"
-
-                        echo "===== Verify local image metadata ====="
-
-                        docker image inspect "$FULL_IMAGE" \
-                            --format='Image ID: {{.Id}}'
+                        docker push "$LATEST_IMAGE"
 
                         echo "Nexus image push completed."
                     '''
@@ -285,11 +334,9 @@ pipeline {
                         exit 1
                     fi
 
-                    echo "===== Validate manifest syntax ====="
+                    echo "===== Client-side manifest validation ====="
 
-                    kubectl \
-                        --kubeconfig /dev/null \
-                        apply \
+                    kubectl apply \
                         --dry-run=client \
                         --validate=false \
                         -f "$RENDERED_MANIFEST" \
@@ -319,12 +366,12 @@ pipeline {
 
                         export KUBECONFIG="$KUBECONFIG_FILE"
 
-                        echo "===== Kubernetes cluster information ====="
+                        echo "===== Kubernetes cluster validation ====="
 
                         kubectl cluster-info
                         kubectl get nodes -o wide
 
-                        echo "===== Create namespace ====="
+                        echo "===== Create or update namespace ====="
 
                         kubectl create namespace "$NAMESPACE" \
                             --dry-run=client \
@@ -343,13 +390,13 @@ pipeline {
                             -o yaml |
                             kubectl apply -f -
 
-                        echo "===== Apply Kubernetes resources ====="
+                        echo "===== Apply Kubernetes manifest ====="
 
                         kubectl apply \
                             --namespace "$NAMESPACE" \
                             -f "$RENDERED_MANIFEST"
 
-                        echo "===== Identify deployment ====="
+                        echo "===== Identify deployment resource ====="
 
                         DEPLOYMENT_RESOURCE=$(
                             kubectl \
@@ -363,11 +410,11 @@ pipeline {
 
                         if [ -z "$DEPLOYMENT_RESOURCE" ]
                         then
-                            echo "ERROR: No Kubernetes Deployment was found."
+                            echo "ERROR: No Deployment resource was found."
                             exit 1
                         fi
 
-                        echo "Deployment resource: $DEPLOYMENT_RESOURCE"
+                        echo "Deployment: $DEPLOYMENT_RESOURCE"
 
                         echo "===== Wait for rollout ====="
 
@@ -415,14 +462,13 @@ pipeline {
                             head -1
                         )
 
-                        echo "===== Deployment status ====="
+                        if [ -z "$DEPLOYMENT_RESOURCE" ]
+                        then
+                            echo "ERROR: No Deployment resource was found."
+                            exit 1
+                        fi
 
-                        kubectl \
-                            --namespace "$NAMESPACE" \
-                            get "$DEPLOYMENT_RESOURCE" \
-                            -o wide
-
-                        echo "===== Deployment image ====="
+                        echo "===== Validate deployed image ====="
 
                         DEPLOYED_IMAGE=$(
                             kubectl \
@@ -437,28 +483,44 @@ pipeline {
 
                         if [ "$DEPLOYED_IMAGE" != "$FULL_IMAGE" ]
                         then
-                            echo "ERROR: Deployed image does not match pipeline image."
+                            echo "ERROR: Deployed image does not match the pipeline image."
                             exit 1
                         fi
 
-                        echo "===== Ready pod validation ====="
+                        echo "===== Validate ready replicas ====="
 
-                        READY_PODS=$(
+                        DESIRED_REPLICAS=$(
                             kubectl \
                                 --namespace "$NAMESPACE" \
-                                get pods \
-                                --field-selector=status.phase=Running \
-                                --no-headers |
-                            wc -l
+                                get "$DEPLOYMENT_RESOURCE" \
+                                -o jsonpath='{.spec.replicas}'
                         )
 
-                        echo "Running pods: $READY_PODS"
+                        READY_REPLICAS=$(
+                            kubectl \
+                                --namespace "$NAMESPACE" \
+                                get "$DEPLOYMENT_RESOURCE" \
+                                -o jsonpath='{.status.readyReplicas}'
+                        )
 
-                        if [ "$READY_PODS" -lt 1 ]
+                        READY_REPLICAS=${READY_REPLICAS:-0}
+
+                        echo
+                        echo "Desired replicas: $DESIRED_REPLICAS"
+                        echo "Ready replicas: $READY_REPLICAS"
+
+                        if [ "$READY_REPLICAS" -lt "$DESIRED_REPLICAS" ]
                         then
-                            echo "ERROR: No running pods were found."
+                            echo "ERROR: Not all deployment replicas are ready."
                             exit 1
                         fi
+
+                        echo "===== Pod status ====="
+
+                        kubectl \
+                            --namespace "$NAMESPACE" \
+                            get pods \
+                            -o wide
 
                         echo "===== Recent Kubernetes events ====="
 
@@ -478,6 +540,8 @@ pipeline {
     post {
         always {
             sh '''
+                set +e
+
                 echo "===== Pipeline cleanup ====="
 
                 CONTAINER_NAME="maximuslabog-smoke-${BUILD_NUMBER}"
@@ -485,18 +549,20 @@ pipeline {
                 docker rm \
                     --force \
                     "$CONTAINER_NAME" \
-                    >/dev/null 2>&1 || true
+                    >/dev/null 2>&1
 
                 docker logout "$REGISTRY" \
-                    >/dev/null 2>&1 || true
+                    >/dev/null 2>&1
 
                 docker image rm \
-                    "${REGISTRY}/${IMAGE_NAME}:latest" \
-                    >/dev/null 2>&1 || true
+                    "$LATEST_IMAGE" \
+                    >/dev/null 2>&1
 
                 docker image rm \
                     "$FULL_IMAGE" \
-                    >/dev/null 2>&1 || true
+                    >/dev/null 2>&1
+
+                exit 0
             '''
 
             archiveArtifacts(
@@ -524,8 +590,8 @@ ${REGISTRY}
 Kubernetes namespace:
 ${NAMESPACE}
 
-The application image was built, tested, pushed to Nexus,
-deployed to Kubernetes, and verified successfully.
+The application image was built, smoke-tested, pushed to
+Nexus, deployed to Kubernetes, and verified successfully.
 
 ============================================================
 """
@@ -537,7 +603,7 @@ deployed to Kubernetes, and verified successfully.
 PIPELINE FAILED
 ============================================================
 
-Review the first failed stage in the Jenkins console output.
+Review the first failed stage in the console output.
 
 Image attempted:
 ${FULL_IMAGE}
