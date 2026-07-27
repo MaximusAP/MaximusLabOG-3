@@ -1,0 +1,8 @@
+
+# Local SSH keys
+yes
+yes.pub
+
+# Backup files
+*.bak
+old-nginxconf

@@ -4,39 +4,44 @@ pipeline {
     }
 
     options {
+        skipDefaultCheckout(true)
         timestamps()
         disableConcurrentBuilds()
+
         buildDiscarder(
             logRotator(
-                numToKeepStr: '20'
+                numToKeepStr: '10',
+                artifactNumToKeepStr: '5'
             )
         )
+
         timeout(
             time: 20,
             unit: 'MINUTES'
         )
-        skipDefaultCheckout(true)
     }
 
     environment {
-        // GitHub configuration
         GIT_REPOSITORY = 'https://github.com/MaximusAP/MaximusLabOG-3.git'
-        GIT_BRANCH     = 'master'
+        GIT_BRANCH = 'master'
 
-        // Nexus Docker registry
-        REGISTRY   = '192.168.2.128:8082'
+        REGISTRY = '192.168.2.128:8082'
         IMAGE_NAME = 'maximuslabog-web'
 
-        // Kubernetes resources
-        NAMESPACE    = 'maximuslabog'
-        DEPLOYMENT   = 'maximuslabog-web'
-        SERVICE      = 'maximuslabog-web'
-        INGRESS_HOST = 'maximuslabog.lab.local'
+        NEXUS_CREDENTIALS_ID = 'nexus-credentials'
+        KUBECONFIG_CREDENTIALS_ID = 'kubeconfig-lab'
 
-        // Build-specific image information
-        IMAGE_TAG     = "${BUILD_NUMBER}"
-        FULL_IMAGE    = "${REGISTRY}/${IMAGE_NAME}:${BUILD_NUMBER}"
-        RENDERED_FILE = 'k8s/rendered-deployment.yaml'
+        NAMESPACE = 'maximuslabog'
+        IMAGE_PULL_SECRET = 'nexus-regcred'
+
+        DOCKER_HOST_IP = '192.168.2.127'
+        SMOKE_TEST_PORT = '18080'
+
+        KUBERNETES_MANIFEST = 'k8s/k8s-deployment.yaml'
+        RENDERED_MANIFEST = 'rendered-k8s.yaml'
+
+        FULL_IMAGE = "${REGISTRY}/${IMAGE_NAME}:${BUILD_NUMBER}"
+        LATEST_IMAGE = "${REGISTRY}/${IMAGE_NAME}:latest"
     }
 
     stages {
@@ -57,30 +62,21 @@ pipeline {
                     git log -1 --oneline
 
                     echo "===== Workspace files ====="
-                    find . -maxdepth 2 -type f | sort
+                    find . -maxdepth 3 -type f | sort
 
-                    echo "===== Validate application files ====="
+                    echo "===== Validate required files ====="
+
                     test -f Dockerfile
                     test -f nginx.conf
                     test -f index.html
-                    test -f k8s/k8s-deployment.yaml
+                    test -f "$KUBERNETES_MANIFEST"
 
-                    echo "===== Validate image placeholder ====="
+                    echo "===== Validate Kubernetes image placeholder ====="
 
-                    if ! grep -q 'IMAGE_PLACEHOLDER' \
-                        k8s/k8s-deployment.yaml
-                    then
-                        echo "ERROR: IMAGE_PLACEHOLDER is missing."
-                        echo "Current image entries:"
-                        grep -n 'image:' \
-                            k8s/k8s-deployment.yaml || true
-                        exit 1
-                    fi
+                    grep -q 'IMAGE_PLACEHOLDER' "$KUBERNETES_MANIFEST"
+                    grep -n 'IMAGE_PLACEHOLDER' "$KUBERNETES_MANIFEST"
 
-                    grep -n 'IMAGE_PLACEHOLDER' \
-                        k8s/k8s-deployment.yaml
-
-                    echo "GitHub checkout validation completed."
+                    echo "Checkout validation completed."
                 '''
             }
         }
@@ -102,7 +98,7 @@ pipeline {
                     curl --version | head -1
 
                     echo "===== Docker daemon connectivity ====="
-                    docker ps >/dev/null
+                    docker ps
 
                     echo "Tool validation completed."
                 '''
@@ -114,17 +110,15 @@ pipeline {
                 sh '''
                     set -eux
 
-                    echo "Building image:"
-                    echo "$FULL_IMAGE"
+                    echo "===== Build Docker image ====="
+                    echo "Image: $FULL_IMAGE"
 
                     docker build \
                         --pull \
                         --tag "$FULL_IMAGE" \
                         .
 
-                    docker image inspect \
-                        "$FULL_IMAGE" \
-                        >/dev/null
+                    docker image inspect "$FULL_IMAGE" >/dev/null
 
                     echo "Docker image build completed."
                 '''
@@ -137,21 +131,14 @@ pipeline {
                     set -eux
 
                     CONTAINER_NAME="maximuslabog-smoke-${BUILD_NUMBER}"
-
-                    docker rm \
-                        --force \
-                        "$CONTAINER_NAME" \
-                        >/dev/null 2>&1 || true
-
-                    docker run \
-                        --detach \
-                        --name "$CONTAINER_NAME" \
-                        --publish 18080:80 \
-                        "$FULL_IMAGE"
+                    SMOKE_BASE_URL="http://${DOCKER_HOST_IP}:${SMOKE_TEST_PORT}"
 
                     cleanup_smoke_test() {
                         echo "===== Smoke-test container logs ====="
+
                         docker logs "$CONTAINER_NAME" || true
+
+                        echo "===== Remove smoke-test container ====="
 
                         docker rm \
                             --force \
@@ -159,11 +146,48 @@ pipeline {
                             >/dev/null 2>&1 || true
                     }
 
+                    echo "===== Remove an existing named container ====="
+
+                    docker rm \
+                        --force \
+                        "$CONTAINER_NAME" \
+                        >/dev/null 2>&1 || true
+
+                    echo "===== Check whether port is already allocated ====="
+
+                    EXISTING_CONTAINER=$(
+                        docker ps \
+                            --filter "publish=${SMOKE_TEST_PORT}" \
+                            --format '{{.ID}}' |
+                        head -1
+                    )
+
+                    if [ -n "$EXISTING_CONTAINER" ]
+                    then
+                        echo "Port ${SMOKE_TEST_PORT} is being used by:"
+                        docker ps --filter "id=$EXISTING_CONTAINER"
+
+                        echo "Removing the container using the smoke-test port."
+
+                        docker rm \
+                            --force \
+                            "$EXISTING_CONTAINER"
+                    fi
+
+                    echo "===== Start smoke-test container ====="
+
+                    docker run \
+                        --detach \
+                        --name "$CONTAINER_NAME" \
+                        --publish "${SMOKE_TEST_PORT}:80" \
+                        "$FULL_IMAGE"
+
                     trap cleanup_smoke_test EXIT
 
-                    HEALTHY=false
+                    echo "Waiting for:"
+                    echo "${SMOKE_BASE_URL}/healthz"
 
-                    echo "Waiting for the local container..."
+                    HEALTHY=false
 
                     for attempt in $(seq 1 20)
                     do
@@ -172,8 +196,10 @@ pipeline {
                         if curl \
                             --fail \
                             --silent \
-                            http://127.0.0.1:18080/healthz
+                            --show-error \
+                            "${SMOKE_BASE_URL}/healthz"
                         then
+                            echo
                             HEALTHY=true
                             break
                         fi
@@ -183,29 +209,67 @@ pipeline {
 
                     if [ "$HEALTHY" != "true" ]
                     then
-                        echo "ERROR: Local container health check failed."
+                        echo "ERROR: Local health check failed."
                         exit 1
                     fi
 
-                    echo "===== Test health endpoint ====="
-
-                    curl \
-                        --fail \
-                        --silent \
-                        --show-error \
-                        http://127.0.0.1:18080/healthz
-
                     echo
-                    echo "===== Test website content ====="
+                    echo "===== Validate health endpoint ====="
 
-                    curl \
-                        --fail \
-                        --silent \
-                        --show-error \
-                        http://127.0.0.1:18080/ |
-                        grep -qi 'Maximus'
+                    HEALTH_HTTP_CODE=$(
+                        curl \
+                            --silent \
+                            --output /dev/null \
+                            --write-out '%{http_code}' \
+                            "${SMOKE_BASE_URL}/healthz"
+                    )
 
-                    echo "Local container smoke test completed."
+                    echo "Health endpoint HTTP status: $HEALTH_HTTP_CODE"
+
+                    if [ "$HEALTH_HTTP_CODE" != "200" ]
+                    then
+                        echo "ERROR: Health endpoint did not return HTTP 200."
+                        exit 1
+                    fi
+
+                    echo "===== Validate website endpoint ====="
+
+                    WEBSITE_HTTP_CODE=$(
+                        curl \
+                            --silent \
+                            --output /dev/null \
+                            --write-out '%{http_code}' \
+                            "${SMOKE_BASE_URL}/"
+                    )
+
+                    echo "Website HTTP status: $WEBSITE_HTTP_CODE"
+
+                    if [ "$WEBSITE_HTTP_CODE" != "200" ]
+                    then
+                        echo "ERROR: Website did not return HTTP 200."
+                        exit 1
+                    fi
+
+                    echo "===== Validate downloaded website size ====="
+
+                    WEBSITE_SIZE=$(
+                        curl \
+                            --fail \
+                            --silent \
+                            --show-error \
+                            "${SMOKE_BASE_URL}/" |
+                        wc -c
+                    )
+
+                    echo "Website response size: $WEBSITE_SIZE bytes"
+
+                    if [ "$WEBSITE_SIZE" -lt 1000 ]
+                    then
+                        echo "ERROR: Website response appears unexpectedly small."
+                        exit 1
+                    fi
+
+                    echo "Local container smoke test completed successfully."
                 '''
             }
         }
@@ -214,41 +278,72 @@ pipeline {
             steps {
                 withCredentials([
                     usernamePassword(
-                        credentialsId: 'nexus-credentials',
-                        usernameVariable: 'NEXUS_USER',
+                        credentialsId: "${NEXUS_CREDENTIALS_ID}",
+                        usernameVariable: 'NEXUS_USERNAME',
                         passwordVariable: 'NEXUS_PASSWORD'
                     )
                 ]) {
                     sh '''
-                        echo "Logging in to Nexus registry: $REGISTRY"
+                        set -eux
 
-                        set +x
+                        echo "===== Login to Nexus Docker registry ====="
 
-                        printf '%s' "$NEXUS_PASSWORD" |
-                        docker login "$REGISTRY" \
-                            --username "$NEXUS_USER" \
-                            --password-stdin
+                        echo "$NEXUS_PASSWORD" |
+                            docker login \
+                                "$REGISTRY" \
+                                --username "$NEXUS_USERNAME" \
+                                --password-stdin
 
-                        LOGIN_STATUS=$?
-
-                        set -x
-
-                        if [ "$LOGIN_STATUS" -ne 0 ]
-                        then
-                            echo "ERROR: Nexus Docker login failed."
-                            exit "$LOGIN_STATUS"
-                        fi
-
-                        echo "Pushing image:"
-                        echo "$FULL_IMAGE"
+                        echo "===== Push versioned image ====="
 
                         docker push "$FULL_IMAGE"
 
-                        docker logout "$REGISTRY" || true
+                        echo "===== Tag and push latest image ====="
 
-                        echo "Image successfully pushed to Nexus."
+                        docker tag \
+                            "$FULL_IMAGE" \
+                            "$LATEST_IMAGE"
+
+                        docker push "$LATEST_IMAGE"
+
+                        echo "Nexus image push completed."
                     '''
                 }
+            }
+        }
+
+        stage('Render Kubernetes Manifest') {
+            steps {
+                sh '''
+                    set -eux
+
+                    echo "===== Render Kubernetes manifest ====="
+
+                    sed \
+                        "s|IMAGE_PLACEHOLDER|${FULL_IMAGE}|g" \
+                        "$KUBERNETES_MANIFEST" \
+                        > "$RENDERED_MANIFEST"
+
+                    echo "===== Confirm rendered image ====="
+
+                    grep -n 'image:' "$RENDERED_MANIFEST"
+
+                    if grep -q 'IMAGE_PLACEHOLDER' "$RENDERED_MANIFEST"
+                    then
+                        echo "ERROR: IMAGE_PLACEHOLDER still exists."
+                        exit 1
+                    fi
+
+                    echo "===== Client-side manifest validation ====="
+
+                    kubectl apply \
+                        --dry-run=client \
+                        --validate=false \
+                        -f "$RENDERED_MANIFEST" \
+                        >/dev/null
+
+                    echo "Manifest rendering completed."
+                '''
             }
         }
 
@@ -256,12 +351,13 @@ pipeline {
             steps {
                 withCredentials([
                     file(
-                        credentialsId: 'kubeconfig-lab',
+                        credentialsId: "${KUBECONFIG_CREDENTIALS_ID}",
                         variable: 'KUBECONFIG_FILE'
                     ),
+
                     usernamePassword(
-                        credentialsId: 'nexus-credentials',
-                        usernameVariable: 'NEXUS_USER',
+                        credentialsId: "${NEXUS_CREDENTIALS_ID}",
+                        usernameVariable: 'NEXUS_USERNAME',
                         passwordVariable: 'NEXUS_PASSWORD'
                     )
                 ]) {
@@ -270,7 +366,7 @@ pipeline {
 
                         export KUBECONFIG="$KUBECONFIG_FILE"
 
-                        echo "===== Kubernetes connection ====="
+                        echo "===== Kubernetes cluster validation ====="
 
                         kubectl cluster-info
                         kubectl get nodes -o wide
@@ -279,70 +375,54 @@ pipeline {
 
                         kubectl create namespace "$NAMESPACE" \
                             --dry-run=client \
-                            --output yaml |
-                        kubectl apply -f -
+                            -o yaml |
+                            kubectl apply -f -
 
-                        echo "===== Create or update Nexus pull secret ====="
-
-                        set +x
+                        echo "===== Create or update Nexus image-pull secret ====="
 
                         kubectl \
                             --namespace "$NAMESPACE" \
-                            create secret docker-registry nexus-regcred \
+                            create secret docker-registry "$IMAGE_PULL_SECRET" \
                             --docker-server="$REGISTRY" \
-                            --docker-username="$NEXUS_USER" \
+                            --docker-username="$NEXUS_USERNAME" \
                             --docker-password="$NEXUS_PASSWORD" \
                             --dry-run=client \
-                            --output yaml |
-                        kubectl apply -f -
-
-                        SECRET_STATUS=$?
-
-                        set -x
-
-                        if [ "$SECRET_STATUS" -ne 0 ]
-                        then
-                            echo "ERROR: Unable to create Nexus registry secret."
-                            exit "$SECRET_STATUS"
-                        fi
-
-                        echo "===== Render deployment manifest ====="
-
-                        mkdir -p "$(dirname "$RENDERED_FILE")"
-
-                        sed \
-                            "s|IMAGE_PLACEHOLDER|$FULL_IMAGE|g" \
-                            k8s/k8s-deployment.yaml \
-                            > "$RENDERED_FILE"
-
-                        if grep -q 'IMAGE_PLACEHOLDER' "$RENDERED_FILE"
-                        then
-                            echo "ERROR: Image placeholder was not replaced."
-                            exit 1
-                        fi
-
-                        echo "Rendered image entry:"
-
-                        grep -n 'image:' "$RENDERED_FILE"
-
-                        echo "===== Validate Kubernetes manifest ====="
-
-                        kubectl apply \
-                            --dry-run=server \
-                            --filename "$RENDERED_FILE"
+                            -o yaml |
+                            kubectl apply -f -
 
                         echo "===== Apply Kubernetes manifest ====="
 
                         kubectl apply \
-                            --filename "$RENDERED_FILE"
+                            --namespace "$NAMESPACE" \
+                            -f "$RENDERED_MANIFEST"
 
-                        echo "===== Wait for deployment rollout ====="
+                        echo "===== Identify deployment resource ====="
+
+                        DEPLOYMENT_RESOURCE=$(
+                            kubectl \
+                                --namespace "$NAMESPACE" \
+                                get \
+                                -f "$RENDERED_MANIFEST" \
+                                -o name |
+                            grep '^deployment.apps/' |
+                            head -1
+                        )
+
+                        if [ -z "$DEPLOYMENT_RESOURCE" ]
+                        then
+                            echo "ERROR: No Deployment resource was found."
+                            exit 1
+                        fi
+
+                        echo "Deployment: $DEPLOYMENT_RESOURCE"
+
+                        echo "===== Wait for rollout ====="
 
                         kubectl \
                             --namespace "$NAMESPACE" \
                             rollout status \
-                            deployment/"$DEPLOYMENT" \
-                            --timeout=180s
+                            "$DEPLOYMENT_RESOURCE" \
+                            --timeout=300s
 
                         echo "Kubernetes deployment completed."
                     '''
@@ -354,7 +434,7 @@ pipeline {
             steps {
                 withCredentials([
                     file(
-                        credentialsId: 'kubeconfig-lab',
+                        credentialsId: "${KUBECONFIG_CREDENTIALS_ID}",
                         variable: 'KUBECONFIG_FILE'
                     )
                 ]) {
@@ -367,100 +447,90 @@ pipeline {
 
                         kubectl \
                             --namespace "$NAMESPACE" \
-                            get deployment,pods,service,ingress \
+                            get deployments,pods,services,ingresses \
                             -o wide
 
-                        echo "===== Wait for application pods ====="
+                        echo "===== Identify deployment ====="
 
-                        kubectl \
-                            --namespace "$NAMESPACE" \
-                            wait \
-                            --for=condition=Ready \
-                            pod \
-                            --selector app=maximuslabog-web \
-                            --timeout=120s
+                        DEPLOYMENT_RESOURCE=$(
+                            kubectl \
+                                --namespace "$NAMESPACE" \
+                                get \
+                                -f "$RENDERED_MANIFEST" \
+                                -o name |
+                            grep '^deployment.apps/' |
+                            head -1
+                        )
 
-                        echo "===== Verify deployed image ====="
+                        if [ -z "$DEPLOYMENT_RESOURCE" ]
+                        then
+                            echo "ERROR: No Deployment resource was found."
+                            exit 1
+                        fi
+
+                        echo "===== Validate deployed image ====="
 
                         DEPLOYED_IMAGE=$(
                             kubectl \
                                 --namespace "$NAMESPACE" \
-                                get deployment "$DEPLOYMENT" \
-                                --output jsonpath='{.spec.template.spec.containers[0].image}'
+                                get "$DEPLOYMENT_RESOURCE" \
+                                -o jsonpath='{.spec.template.spec.containers[0].image}'
                         )
 
+                        echo
                         echo "Expected image: $FULL_IMAGE"
                         echo "Deployed image: $DEPLOYED_IMAGE"
 
                         if [ "$DEPLOYED_IMAGE" != "$FULL_IMAGE" ]
                         then
-                            echo "ERROR: Kubernetes is not using the expected image."
+                            echo "ERROR: Deployed image does not match the pipeline image."
                             exit 1
                         fi
 
-                        echo "===== Service port-forward test ====="
+                        echo "===== Validate ready replicas ====="
+
+                        DESIRED_REPLICAS=$(
+                            kubectl \
+                                --namespace "$NAMESPACE" \
+                                get "$DEPLOYMENT_RESOURCE" \
+                                -o jsonpath='{.spec.replicas}'
+                        )
+
+                        READY_REPLICAS=$(
+                            kubectl \
+                                --namespace "$NAMESPACE" \
+                                get "$DEPLOYMENT_RESOURCE" \
+                                -o jsonpath='{.status.readyReplicas}'
+                        )
+
+                        READY_REPLICAS=${READY_REPLICAS:-0}
+
+                        echo
+                        echo "Desired replicas: $DESIRED_REPLICAS"
+                        echo "Ready replicas: $READY_REPLICAS"
+
+                        if [ "$READY_REPLICAS" -lt "$DESIRED_REPLICAS" ]
+                        then
+                            echo "ERROR: Not all deployment replicas are ready."
+                            exit 1
+                        fi
+
+                        echo "===== Pod status ====="
 
                         kubectl \
                             --namespace "$NAMESPACE" \
-                            port-forward \
-                            service/"$SERVICE" \
-                            18081:80 \
-                            >/tmp/maximuslabog-port-forward.log 2>&1 &
+                            get pods \
+                            -o wide
 
-                        PORT_FORWARD_PID=$!
+                        echo "===== Recent Kubernetes events ====="
 
-                        cleanup_port_forward() {
-                            kill "$PORT_FORWARD_PID" \
-                                >/dev/null 2>&1 || true
-                        }
+                        kubectl \
+                            --namespace "$NAMESPACE" \
+                            get events \
+                            --sort-by='.lastTimestamp' |
+                            tail -20 || true
 
-                        trap cleanup_port_forward EXIT
-
-                        PORT_FORWARD_READY=false
-
-                        for attempt in $(seq 1 20)
-                        do
-                            echo "Port-forward test attempt: $attempt"
-
-                            if curl \
-                                --fail \
-                                --silent \
-                                http://127.0.0.1:18081/healthz
-                            then
-                                PORT_FORWARD_READY=true
-                                break
-                            fi
-
-                            sleep 2
-                        done
-
-                        if [ "$PORT_FORWARD_READY" != "true" ]
-                        then
-                            echo "ERROR: Kubernetes service test failed."
-                            echo "===== Port-forward log ====="
-                            cat /tmp/maximuslabog-port-forward.log || true
-                            exit 1
-                        fi
-
-                        echo "===== Verify Kubernetes health endpoint ====="
-
-                        curl \
-                            --fail \
-                            --silent \
-                            --show-error \
-                            http://127.0.0.1:18081/healthz
-
-                        echo
-                        echo "===== Verify Kubernetes website content ====="
-
-                        curl \
-                            --fail \
-                            --silent \
-                            --show-error \
-                            http://127.0.0.1:18081/ |
-                        grep -qi 'Maximus'
-
-                        echo "End-to-end Kubernetes test completed."
+                        echo "End-to-end Kubernetes verification completed."
                     '''
                 }
             }
@@ -468,23 +538,60 @@ pipeline {
     }
 
     post {
+        always {
+            sh '''
+                set +e
+
+                echo "===== Pipeline cleanup ====="
+
+                CONTAINER_NAME="maximuslabog-smoke-${BUILD_NUMBER}"
+
+                docker rm \
+                    --force \
+                    "$CONTAINER_NAME" \
+                    >/dev/null 2>&1
+
+                docker logout "$REGISTRY" \
+                    >/dev/null 2>&1
+
+                docker image rm \
+                    "$LATEST_IMAGE" \
+                    >/dev/null 2>&1
+
+                docker image rm \
+                    "$FULL_IMAGE" \
+                    >/dev/null 2>&1
+
+                exit 0
+            '''
+
+            archiveArtifacts(
+                artifacts: 'rendered-k8s.yaml',
+                allowEmptyArchive: true,
+                fingerprint: true
+            )
+        }
+
         success {
             echo """
 ============================================================
-DEPLOYMENT SUCCESSFUL
+PIPELINE SUCCESSFUL
 ============================================================
+
+Git repository:
+${GIT_REPOSITORY}
 
 Docker image:
 ${FULL_IMAGE}
 
+Nexus registry:
+${REGISTRY}
+
 Kubernetes namespace:
 ${NAMESPACE}
 
-Kubernetes deployment:
-${DEPLOYMENT}
-
-Application URL:
-http://${INGRESS_HOST}
+The application image was built, smoke-tested, pushed to
+Nexus, deployed to Kubernetes, and verified successfully.
 
 ============================================================
 """
@@ -506,28 +613,6 @@ ${NAMESPACE}
 
 ============================================================
 """
-        }
-
-        always {
-            sh '''
-                echo "===== Pipeline cleanup ====="
-
-                docker rm \
-                    --force \
-                    "maximuslabog-smoke-${BUILD_NUMBER}" \
-                    >/dev/null 2>&1 || true
-
-                docker logout "$REGISTRY" \
-                    >/dev/null 2>&1 || true
-
-                docker image rm "$FULL_IMAGE" \
-                    >/dev/null 2>&1 || true
-            '''
-
-            archiveArtifacts(
-                artifacts: 'k8s/rendered-deployment.yaml',
-                allowEmptyArchive: true
-            )
         }
     }
 }
