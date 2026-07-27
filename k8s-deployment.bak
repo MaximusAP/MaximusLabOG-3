@@ -1,0 +1,110 @@
+---
+# Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: maximuslab
+  labels:
+    app: maximuslab-web
+
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maximuslab-web
+  namespace: maximuslab
+  labels:
+    app: maximuslab-web
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: maximuslab-web
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: maximuslab-web
+    spec:
+      containers:
+        - name: maximuslab-web
+          image: maximuslab:latest          # Replace with your registry image
+          imagePullPolicy: IfNotPresent     # Use Always if pulling from remote registry
+          ports:
+            - containerPort: 80
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+      restartPolicy: Always
+
+---
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: maximuslab-web
+  namespace: maximuslab
+  labels:
+    app: maximuslab-web
+spec:
+  selector:
+    app: maximuslab-web
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+  type: ClusterIP          # Change to LoadBalancer or NodePort if no Ingress
+
+---
+# Ingress (adjust host and TLS for your cluster)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: maximuslab-web
+  namespace: maximuslab
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    # Uncomment for cert-manager TLS:
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: nginx      # Change if using a different ingress controller
+  rules:
+    - host: maximuslab.local   # Replace with your domain
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: maximuslab-web
+                port:
+                  number: 80
+  # Uncomment to enable TLS:
+  # tls:
+  #   - hosts:
+  #       - maximuslab.local
+  #     secretName: maximuslab-tls
