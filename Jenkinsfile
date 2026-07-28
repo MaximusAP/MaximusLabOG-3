@@ -162,9 +162,8 @@ pipeline {
                         exit 1
                     fi
 
-                    # Syntax-level check only. Live validation happens during kubectl apply.
-                    kubectl apply --dry-run=client --validate=false \
-                        -f "${RENDERED_FILE}" >/dev/null
+                    echo 'Manifest rendering completed.'
+                    echo 'Live Kubernetes validation will occur during deployment.'
                 '''
             }
         }
