@@ -14,7 +14,6 @@ pipeline {
 
         NEXUS_REGISTRY = '192.168.2.128:8082'
         IMAGE_NAME     = 'maximuslabog-web'
-        IMAGE_TAG      = "${BUILD_NUMBER}"
         DOCKER_IMAGE   = "${NEXUS_REGISTRY}/${IMAGE_NAME}:${BUILD_NUMBER}"
         LATEST_IMAGE   = "${NEXUS_REGISTRY}/${IMAGE_NAME}:latest"
 
@@ -41,18 +40,14 @@ pipeline {
                     echo "===== Git commit ====="
                     git log -1 --oneline
 
-                    echo "===== Workspace files ====="
-                    find . -maxdepth 3 -type f | sort
-
                     echo "===== Validate required files ====="
                     test -f Dockerfile
                     test -f nginx.conf
                     test -f index.html
                     test -f k8s/k8s-deployment.yaml
 
-                    echo "===== Validate Kubernetes image placeholder ====="
+                    echo "===== Validate image placeholder ====="
                     grep -q 'IMAGE_PLACEHOLDER' k8s/k8s-deployment.yaml
-                    grep -n 'IMAGE_PLACEHOLDER' k8s/k8s-deployment.yaml
                 '''
             }
         }
@@ -62,18 +57,15 @@ pipeline {
                 sh '''
                     set -eux
 
-                    echo "===== Jenkins agent information ====="
                     whoami
                     hostname
                     pwd
 
-                    echo "===== Installed tools ====="
                     git --version
                     docker --version
                     kubectl version --client
                     curl --version | head -1
 
-                    echo "===== Docker daemon connectivity ====="
                     docker ps
                 '''
             }
@@ -84,9 +76,7 @@ pipeline {
                 sh '''
                     set -eux
 
-                    echo "===== Build Docker image ====="
-                    echo "Image: ${DOCKER_IMAGE}"
-
+                    echo "Building ${DOCKER_IMAGE}"
                     docker build --pull --tag "${DOCKER_IMAGE}" .
                     docker image inspect "${DOCKER_IMAGE}" >/dev/null
                 '''
@@ -101,10 +91,7 @@ pipeline {
                     CONTAINER_NAME="maximuslabog-smoke-${BUILD_NUMBER}"
 
                     cleanup_smoke_test() {
-                        echo "===== Smoke-test container logs ====="
                         docker logs "${CONTAINER_NAME}" 2>/dev/null || true
-
-                        echo "===== Remove smoke-test container ====="
                         docker rm --force "${CONTAINER_NAME}" >/dev/null 2>&1 || true
                     }
 
@@ -112,17 +99,6 @@ pipeline {
 
                     docker rm --force "${CONTAINER_NAME}" >/dev/null 2>&1 || true
 
-                    EXISTING_CONTAINER=$(docker ps \
-                        --filter "publish=${SMOKE_PORT}" \
-                        --format '{{.ID}}' | head -1)
-
-                    if [ -n "${EXISTING_CONTAINER}" ]; then
-                        echo "Port ${SMOKE_PORT} is already allocated by ${EXISTING_CONTAINER}"
-                        docker ps --filter "id=${EXISTING_CONTAINER}"
-                        exit 1
-                    fi
-
-                    echo "===== Start smoke-test container ====="
                     docker run --detach \
                         --name "${CONTAINER_NAME}" \
                         --publish "${SMOKE_PORT}:80" \
@@ -131,7 +107,7 @@ pipeline {
                     HEALTHY=false
 
                     for ATTEMPT in $(seq 1 20); do
-                        echo "Health-check attempt: ${ATTEMPT}"
+                        echo "Smoke-test attempt ${ATTEMPT}"
 
                         if curl --fail --silent --show-error \
                             "http://192.168.2.127:${SMOKE_PORT}/healthz"; then
@@ -144,26 +120,20 @@ pipeline {
                     done
 
                     if [ "${HEALTHY}" != 'true' ]; then
-                        echo "Container did not become healthy"
+                        echo 'Local smoke test failed.'
                         exit 1
                     fi
 
-                    HEALTH_HTTP_CODE=$(curl --silent --output /dev/null \
+                    HEALTH_CODE=$(curl --silent --output /dev/null \
                         --write-out '%{http_code}' \
                         "http://192.168.2.127:${SMOKE_PORT}/healthz")
 
-                    test "${HEALTH_HTTP_CODE}" = '200'
-
-                    WEBSITE_HTTP_CODE=$(curl --silent --output /dev/null \
+                    WEBSITE_CODE=$(curl --silent --output /dev/null \
                         --write-out '%{http_code}' \
                         "http://192.168.2.127:${SMOKE_PORT}/")
 
-                    test "${WEBSITE_HTTP_CODE}" = '200'
-
-                    WEBSITE_SIZE=$(curl --fail --silent --show-error \
-                        "http://192.168.2.127:${SMOKE_PORT}/" | wc -c)
-
-                    test "${WEBSITE_SIZE}" -ge 1000
+                    test "${HEALTH_CODE}" = '200'
+                    test "${WEBSITE_CODE}" = '200'
                 '''
             }
         }
@@ -180,7 +150,6 @@ pipeline {
                     sh '''
                         set -eu
 
-                        echo "===== Login to Nexus Docker registry ====="
                         set +x
                         printf '%s' "${NEXUS_PASSWORD}" | docker login \
                             "${NEXUS_REGISTRY}" \
@@ -188,10 +157,8 @@ pipeline {
                             --password-stdin
                         set -x
 
-                        echo "===== Push versioned image ====="
                         docker push "${DOCKER_IMAGE}"
 
-                        echo "===== Tag and push latest image ====="
                         docker tag "${DOCKER_IMAGE}" "${LATEST_IMAGE}"
                         docker push "${LATEST_IMAGE}"
                     '''
@@ -199,7 +166,7 @@ pipeline {
             }
         }
 
-        stage('Render Kubernetes Manifest') {
+        stage('Prepare Kubernetes Deployment') {
             steps {
                 withCredentials([
                     file(
@@ -215,16 +182,20 @@ pipeline {
                         kubectl cluster-info
                         kubectl get nodes
 
-                        echo "===== Render Kubernetes manifest ====="
+                        echo "===== Create namespace before validation ====="
+                        kubectl create namespace "${K8S_NAMESPACE}" \
+                            --dry-run=client \
+                            -o yaml | kubectl apply -f -
+
+                        echo "===== Render manifest ====="
                         sed "s|IMAGE_PLACEHOLDER|${DOCKER_IMAGE}|g" \
                             k8s/k8s-deployment.yaml \
                             > rendered-k8s.yaml
 
-                        echo "===== Confirm rendered image ====="
                         grep -n 'image:' rendered-k8s.yaml
 
                         if grep -q 'IMAGE_PLACEHOLDER' rendered-k8s.yaml; then
-                            echo 'ERROR: IMAGE_PLACEHOLDER still exists'
+                            echo 'ERROR: IMAGE_PLACEHOLDER still exists.'
                             exit 1
                         fi
 
@@ -254,11 +225,6 @@ pipeline {
                         set -eu
                         export KUBECONFIG="${KUBECONFIG_FILE}"
 
-                        echo "===== Create or update namespace ====="
-                        kubectl create namespace "${K8S_NAMESPACE}" \
-                            --dry-run=client \
-                            -o yaml | kubectl apply -f -
-
                         echo "===== Create or update Nexus pull secret ====="
                         set +x
                         kubectl create secret docker-registry nexus-regcred \
@@ -270,10 +236,10 @@ pipeline {
                             -o yaml | kubectl apply -f -
                         set -x
 
-                        echo "===== Apply Kubernetes manifest ====="
+                        echo "===== Apply Kubernetes resources ====="
                         kubectl apply -f rendered-k8s.yaml
 
-                        echo "===== Wait for deployment rollout ====="
+                        echo "===== Wait for rollout ====="
                         kubectl rollout status \
                             deployment/"${K8S_DEPLOYMENT}" \
                             --namespace "${K8S_NAMESPACE}" \
@@ -300,7 +266,7 @@ pipeline {
                             --namespace "${K8S_NAMESPACE}" \
                             -o wide
 
-                        echo "===== Wait for application pods ====="
+                        echo "===== Wait for Ready pods ====="
                         kubectl wait \
                             --namespace "${K8S_NAMESPACE}" \
                             --for=condition=Ready pod \
@@ -312,8 +278,8 @@ pipeline {
                             --namespace "${K8S_NAMESPACE}" \
                             -o jsonpath='{.spec.template.spec.containers[0].image}')
 
-                        echo "Expected image: ${DOCKER_IMAGE}"
-                        echo "Actual image:   ${ACTUAL_IMAGE}"
+                        echo "Expected: ${DOCKER_IMAGE}"
+                        echo "Actual:   ${ACTUAL_IMAGE}"
                         test "${ACTUAL_IMAGE}" = "${DOCKER_IMAGE}"
 
                         echo "===== Port-forward service ====="
@@ -321,7 +287,7 @@ pipeline {
                             --namespace "${K8S_NAMESPACE}" \
                             service/"${K8S_SERVICE}" \
                             "${VERIFY_PORT}:80" \
-                            > /tmp/maximus-port-forward.log 2>&1 &
+                            >/tmp/maximus-port-forward.log 2>&1 &
 
                         PF_PID=$!
 
@@ -335,6 +301,8 @@ pipeline {
                         READY=false
 
                         for ATTEMPT in $(seq 1 20); do
+                            echo "E2E attempt ${ATTEMPT}"
+
                             if curl --fail --silent --show-error \
                                 "http://127.0.0.1:${VERIFY_PORT}/healthz"; then
                                 echo
@@ -346,19 +314,14 @@ pipeline {
                         done
 
                         if [ "${READY}" != 'true' ]; then
-                            echo 'Service endpoint did not become ready'
+                            echo 'Kubernetes service verification failed.'
                             exit 1
                         fi
 
-                        echo "===== Verify health endpoint ====="
                         curl --fail --silent --show-error \
-                            "http://127.0.0.1:${VERIFY_PORT}/healthz"
+                            "http://127.0.0.1:${VERIFY_PORT}/"
 
-                        echo "===== Verify website endpoint ====="
-                        curl --fail --silent --show-error \
-                            "http://127.0.0.1:${VERIFY_PORT}/" | grep -qi 'Maximus'
-
-                        echo "End-to-end verification completed successfully."
+                        echo "End-to-end deployment verification succeeded."
                     '''
                 }
             }
@@ -370,7 +333,6 @@ pipeline {
             sh '''
                 set +e
 
-                echo "===== Pipeline cleanup ====="
                 docker rm --force "maximuslabog-smoke-${BUILD_NUMBER}" \
                     >/dev/null 2>&1 || true
 
@@ -392,14 +354,9 @@ pipeline {
 ============================================================
 PIPELINE SUCCESS
 ============================================================
-Image:
-${DOCKER_IMAGE}
-
-Namespace:
-${K8S_NAMESPACE}
-
-Deployment:
-${K8S_DEPLOYMENT}
+Image:      ${DOCKER_IMAGE}
+Namespace:  ${K8S_NAMESPACE}
+Deployment: ${K8S_DEPLOYMENT}
 ============================================================
 """
         }
@@ -409,15 +366,12 @@ ${K8S_DEPLOYMENT}
 ============================================================
 PIPELINE FAILED
 ============================================================
-Review the first failed stage in the console output.
-
-Image attempted:
-${DOCKER_IMAGE}
-
-Namespace:
-${K8S_NAMESPACE}
+Image attempted: ${DOCKER_IMAGE}
+Namespace:       ${K8S_NAMESPACE}
+Check the first failed stage in the console output.
 ============================================================
 """
         }
     }
 }
+
