@@ -124,7 +124,7 @@ pipeline {
             steps {
                 withCredentials([
                     usernamePassword(
-                        credentialsId: 'nexus-docker-credentials',
+                        credentialsId: 'nexus-credentials',
                         usernameVariable: 'NEXUS_USERNAME',
                         passwordVariable: 'NEXUS_PASSWORD'
                     )
@@ -177,7 +177,7 @@ pipeline {
                         variable: 'KUBECONFIG_FILE'
                     ),
                     usernamePassword(
-                        credentialsId: 'nexus-docker-credentials',
+                        credentialsId: 'nexus-credentials',
                         usernameVariable: 'NEXUS_USERNAME',
                         passwordVariable: 'NEXUS_PASSWORD'
                     )
